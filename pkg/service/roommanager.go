@@ -835,7 +835,77 @@ func (r *RoomManager) ForwardParticipant(ctx context.Context, req *livekit.Forwa
 }
 
 func (r *RoomManager) MoveParticipant(ctx context.Context, req *livekit.MoveParticipantRequest) (*livekit.MoveParticipantResponse, error) {
-	return nil, errors.New("not implemented")
+	room, participant, err := r.roomAndParticipantForReq(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	destRoomName := livekit.RoomName(req.DestinationRoom)
+	destRoom := r.GetRoom(ctx, destRoomName)
+	if destRoom == nil {
+		return nil, ErrRoomNotFound
+	}
+
+	key, secret, err := r.getFirstKeyPair()
+	if err != nil {
+		return nil, err
+	}
+
+	grants := participant.ClaimGrants()
+	if grants == nil {
+		return nil, errors.New("participant has no claim grants")
+	}
+
+	videoGrant := grants.Video
+	if videoGrant == nil {
+		videoGrant = &auth.VideoGrant{}
+	} else {
+		videoGrant = videoGrant.Clone()
+	}
+	videoGrant.Room = string(destRoomName)
+	videoGrant.RoomJoin = true
+
+	token := auth.NewAccessToken(key, secret)
+	token.SetName(grants.Name).
+		SetIdentity(string(participant.Identity())).
+		SetKind(grants.GetParticipantKind()).
+		SetValidFor(tokenDefaultTTL).
+		SetMetadata(grants.Metadata).
+		SetAttributes(grants.Attributes).
+		SetVideoGrant(videoGrant).
+		SetRoomConfig(grants.GetRoomConfiguration()).
+		SetRoomPreset(grants.RoomPreset)
+
+	jwt, err := token.ToJWT()
+	if err != nil {
+		return nil, err
+	}
+
+	otherParticipants := make([]*livekit.ParticipantInfo, 0)
+	for _, p := range destRoom.GetParticipants() {
+		if !p.Hidden() {
+			otherParticipants = append(otherParticipants, p.ToProto())
+		}
+	}
+
+	roomMoved := &livekit.RoomMovedResponse{
+		Room:              destRoom.ToProto(),
+		Token:             jwt,
+		Participant:       participant.ToProto(),
+		OtherParticipants: otherParticipants,
+	}
+
+	if err := participant.SendRoomMovedResponse(roomMoved); err != nil {
+		participant.GetLogger().Errorw("failed to send room moved response", err)
+		return nil, err
+	}
+
+	participant.GetLogger().Infow("moved participant to destination room",
+		"sourceRoom", req.Room,
+		"destinationRoom", req.DestinationRoom)
+	room.RemoveParticipant(participant.Identity(), participant.ID(), types.ParticipantCloseReasonMigrationRequested)
+
+	return &livekit.MoveParticipantResponse{}, nil
 }
 
 func (r *RoomManager) PerformRpc(ctx context.Context, req *livekit.PerformRpcRequest) (*livekit.PerformRpcResponse, error) {
