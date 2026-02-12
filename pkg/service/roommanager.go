@@ -903,7 +903,26 @@ func (r *RoomManager) MoveParticipant(ctx context.Context, req *livekit.MovePart
 	participant.GetLogger().Infow("moved participant to destination room",
 		"sourceRoom", req.Room,
 		"destinationRoom", req.DestinationRoom)
-	room.RemoveParticipant(participant.Identity(), participant.ID(), types.ParticipantCloseReasonMigrationRequested)
+
+	// For SIP participants, we need to add a grace period before removing them from the source room.
+	// SIP participants need time to receive the move signal and establish a new WebRTC connection
+	// to the destination room. Without this delay, they get disconnected before they can reconnect,
+	// resulting in DTLS timeout errors.
+	if participant.Kind() == livekit.ParticipantInfo_SIP {
+		participantIdentity := participant.Identity()
+		participantID := participant.ID()
+		participant.GetLogger().Infow("delaying removal of SIP participant to allow reconnection",
+			"gracePerioSeconds", 2)
+
+		// Use a goroutine to avoid blocking the API response
+		go func() {
+			time.Sleep(2 * time.Second)
+			room.RemoveParticipant(participantIdentity, participantID, types.ParticipantCloseReasonMigrationRequested)
+		}()
+	} else {
+		// For non-SIP participants, remove immediately as before
+		room.RemoveParticipant(participant.Identity(), participant.ID(), types.ParticipantCloseReasonMigrationRequested)
+	}
 
 	return &livekit.MoveParticipantResponse{}, nil
 }
