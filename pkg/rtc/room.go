@@ -1458,7 +1458,10 @@ func (r *Room) RemoveParticipant(
 	p.ClearParticipantListener()
 
 	// close participant as well
-	_ = p.Close(true, reason, false)
+	// For migration, pass isExpectedToResume=true so the server sends LeaveRequest with RESUME
+	// action instead of DISCONNECT. This allows the client SDK to reconnect to the new room.
+	isExpectedToResume := reason == types.ParticipantCloseReasonMigrationRequested
+	_ = p.Close(true, reason, isExpectedToResume)
 
 	r.leftAt.Store(time.Now().Unix())
 
