@@ -903,63 +903,7 @@ func (r *RoomManager) MoveParticipant(ctx context.Context, req *livekit.MovePart
 	participant.GetLogger().Infow("moved participant to destination room",
 		"sourceRoom", req.Room,
 		"destinationRoom", req.DestinationRoom)
-
-	// For SIP participants, we need to add a grace period before removing them from the source room.
-	// SIP participants need time to receive the move signal and establish a new WebRTC connection
-	// to the destination room. Without this delay, they get disconnected before they can reconnect,
-	// resulting in DTLS timeout errors.
-	//
-	// Based on testing, 2 seconds was insufficient. Increasing to 10 seconds to allow for:
-	// - Signal propagation time
-	// - SIP re-INVITE processing
-	// - New WebRTC peer connection establishment
-	// - ICE candidate gathering and connectivity checks
-	if participant.Kind() == livekit.ParticipantInfo_SIP {
-		participantIdentity := participant.Identity()
-		participantID := participant.ID()
-		gracePeriod := 10 * time.Second
-
-		participant.GetLogger().Infow("delaying removal of SIP participant to allow reconnection",
-			"gracePeriodSeconds", int(gracePeriod.Seconds()))
-
-		// Use a goroutine to avoid blocking the API response
-		go func() {
-			// Poll destination room to see if participant has joined successfully
-			// This allows us to clean up the source room as soon as the move is complete
-			ticker := time.NewTicker(500 * time.Millisecond)
-			defer ticker.Stop()
-
-			startTime := time.Now()
-			timeout := time.After(gracePeriod)
-
-			for {
-				select {
-				case <-timeout:
-					// Grace period expired, remove participant from source room
-					participant.GetLogger().Infow("grace period expired, removing SIP participant from source room",
-						"gracePeriodSeconds", int(gracePeriod.Seconds()))
-					room.RemoveParticipant(participantIdentity, participantID, types.ParticipantCloseReasonMigrationRequested)
-					return
-
-				case <-ticker.C:
-					// Check if participant has joined the destination room
-					destParticipant := destRoom.GetParticipant(participantIdentity)
-					if destParticipant != nil && destParticipant.ID() != participantID {
-						// Participant successfully joined destination room with new ID
-						elapsed := time.Since(startTime)
-						participant.GetLogger().Infow("SIP participant joined destination room, removing from source room",
-							"newParticipantID", destParticipant.ID(),
-							"elapsedMs", elapsed.Milliseconds())
-						room.RemoveParticipant(participantIdentity, participantID, types.ParticipantCloseReasonMigrationRequested)
-						return
-					}
-				}
-			}
-		}()
-	} else {
-		// For non-SIP participants, remove immediately as before
-		room.RemoveParticipant(participant.Identity(), participant.ID(), types.ParticipantCloseReasonMigrationRequested)
-	}
+	room.RemoveParticipant(participant.Identity(), participant.ID(), types.ParticipantCloseReasonMigrationRequested)
 
 	return &livekit.MoveParticipantResponse{}, nil
 }
