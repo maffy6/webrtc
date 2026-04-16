@@ -20,12 +20,13 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"fmt"
+	"maps"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/pkg/errors"
-	"golang.org/x/exp/maps"
 
 	"github.com/livekit/mediatransportutil/pkg/rtcconfig"
 	"github.com/livekit/protocol/auth"
@@ -214,7 +215,7 @@ func (r *RoomManager) deleteRoom(ctx context.Context, roomName livekit.RoomName)
 
 func (r *RoomManager) CloseIdleRooms() {
 	r.lock.RLock()
-	rooms := maps.Values(r.rooms)
+	rooms := slices.Collect(maps.Values(r.rooms))
 	r.lock.RUnlock()
 
 	for _, room := range rooms {
@@ -237,7 +238,7 @@ func (r *RoomManager) HasParticipants() bool {
 func (r *RoomManager) Stop() {
 	// disconnect all clients
 	r.lock.RLock()
-	rooms := maps.Values(r.rooms)
+	rooms := slices.Collect(maps.Values(r.rooms))
 	r.lock.RUnlock()
 
 	for _, room := range rooms {
@@ -469,7 +470,7 @@ func (r *RoomManager) StartSession(
 		LimitConfig:             r.config.Limit,
 		ProtocolVersion:         pv,
 		SessionStartTime:        sessionStartTime,
-		Telemetry:               r.telemetry,
+		TelemetryListener:       room.ParticipantTelemetryListener(),
 		Trailer:                 room.Trailer(),
 		PLIThrottleConfig:       r.config.RTC.PLIThrottle,
 		CongestionControlConfig: r.config.RTC.CongestionControl,
@@ -774,6 +775,37 @@ func (r *RoomManager) roomAndParticipantForReq(ctx context.Context, req particip
 	return room, participant, nil
 }
 
+func (r *RoomManager) ListParticipants(ctx context.Context, req *livekit.ListParticipantsRequest) (*livekit.ListParticipantsResponse, error) {
+	room := r.GetRoom(ctx, livekit.RoomName(req.Room))
+	if room == nil {
+		return nil, ErrRoomNotFound
+	}
+
+	participants := room.GetParticipants()
+	items := make([]*livekit.ParticipantInfo, 0, len(participants))
+	for _, p := range participants {
+		items = append(items, p.ToProto())
+	}
+
+	return &livekit.ListParticipantsResponse{
+		Participants: items,
+	}, nil
+}
+
+func (r *RoomManager) GetParticipant(ctx context.Context, req *livekit.RoomParticipantIdentity) (*livekit.ParticipantInfo, error) {
+	room := r.GetRoom(ctx, livekit.RoomName(req.Room))
+	if room == nil {
+		return nil, ErrRoomNotFound
+	}
+
+	participant := room.GetParticipant(livekit.ParticipantIdentity(req.Identity))
+	if participant == nil {
+		return nil, ErrParticipantNotFound
+	}
+
+	return participant.ToProto(), nil
+}
+
 func (r *RoomManager) RemoveParticipant(ctx context.Context, req *livekit.RoomParticipantIdentity) (*livekit.RemoveParticipantResponse, error) {
 	room, participant, err := r.roomAndParticipantForReq(ctx, req)
 	if err != nil {
@@ -1062,7 +1094,9 @@ func (r *RoomManager) iceServersForParticipant(apiKey string, participant types.
 		if r.config.TURN.UDPPort > 0 && !tlsOnly {
 			// UDP TURN is used as STUN
 			hasSTUN = true
-			urls = append(urls, fmt.Sprintf("turn:%s:%d?transport=udp", r.config.RTC.NodeIP, r.config.TURN.UDPPort))
+			for _, ip := range r.config.RTC.NodeIP.ToStringSlice() {
+				urls = append(urls, fmt.Sprintf("turn:%s:%d?transport=udp", ip, r.config.TURN.UDPPort))
+			}
 		}
 		if r.config.TURN.TLSPort > 0 {
 			urls = append(urls, fmt.Sprintf("turns:%s:443?transport=tcp", r.config.TURN.Domain))

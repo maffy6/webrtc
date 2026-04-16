@@ -17,6 +17,7 @@ package rtc
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math"
 	"slices"
 	"sort"
@@ -25,9 +26,9 @@ import (
 	"time"
 
 	"go.uber.org/atomic"
-	"golang.org/x/exp/maps"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/livekit/protocol/codecs/mime"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 	"github.com/livekit/protocol/observability/roomobs"
@@ -147,8 +148,9 @@ type Room struct {
 
 	dataMessageCache *utils.TimeSizeCache[types.DataMessageCache]
 
-	onStateChangeMu          sync.Mutex
-	localParticipantListener types.LocalParticipantListener
+	onStateChangeMu              sync.Mutex
+	localParticipantListener     types.LocalParticipantListener
+	participantTelemetryListener types.ParticipantTelemetryListener
 }
 
 type ParticipantOptions struct {
@@ -194,7 +196,7 @@ func (ad *agentDispatch) jobsLaunching() (jobsLaunched func()) {
 
 func (ad *agentDispatch) waitForPendingJobs() {
 	ad.lock.Lock()
-	cs := maps.Keys(ad.pending)
+	cs := slices.Collect(maps.Keys(ad.pending))
 	ad.lock.Unlock()
 
 	for _, c := range cs {
@@ -286,6 +288,7 @@ func NewRoom(
 	}
 	r.trackManager = NewRoomTrackManager(r.logger)
 	r.localParticipantListener = &localParticipantListener{room: r}
+	r.participantTelemetryListener = &participantTelemetryListener{room: r}
 
 	if r.protoRoom.EmptyTimeout == 0 {
 		r.protoRoom.EmptyTimeout = roomConfig.EmptyTimeout
@@ -302,7 +305,7 @@ func NewRoom(
 
 	r.createAgentDispatchesFromRoomAgent()
 
-	r.launchRoomAgents(maps.Values(r.agentDispatches))
+	r.launchRoomAgents(slices.Collect(maps.Values(r.agentDispatches)))
 
 	go r.audioUpdateWorker()
 	go r.connectionQualityWorker()
@@ -361,7 +364,7 @@ func (r *Room) GetParticipants() []types.LocalParticipant {
 	r.lock.RLock()
 	defer r.lock.RUnlock()
 
-	return maps.Values(r.participants)
+	return slices.Collect(maps.Values(r.participants))
 }
 
 func (r *Room) GetLocalParticipants() []types.LocalParticipant {
@@ -466,11 +469,11 @@ func (r *Room) Join(
 		r.joinedAt.Store(time.Now().Unix())
 	}
 
-	r.launchTargetAgents(maps.Values(r.agentDispatches), participant, livekit.JobType_JT_PARTICIPANT)
+	r.launchTargetAgents(slices.Collect(maps.Values(r.agentDispatches)), participant, livekit.JobType_JT_PARTICIPANT)
 
 	r.logger.Debugw(
 		"new participant joined",
-		"pID", participant.ID(),
+		"participantID", participant.ID(),
 		"participant", participant.Identity(),
 		"clientInfo", logger.Proto(participant.GetClientInfo()),
 		"options", opts,
@@ -1037,7 +1040,7 @@ func (r *Room) createJoinResponseLocked(
 		OtherParticipants: GetOtherParticipantInfo(
 			participant,
 			false, // isMigratingIn
-			toParticipants(maps.Values(r.participants)),
+			toParticipants(slices.Collect(maps.Values(r.participants))),
 			false, // skipSubscriberBroadcast
 		),
 		IceServers: iceServers,
@@ -1101,7 +1104,7 @@ func (r *Room) onTrackPublished(participant types.Participant, track types.Media
 
 	if !hasPublished {
 		r.lock.RLock()
-		r.launchTargetAgents(maps.Values(r.agentDispatches), participant, livekit.JobType_JT_PUBLISHER)
+		r.launchTargetAgents(slices.Collect(maps.Values(r.agentDispatches)), participant, livekit.JobType_JT_PUBLISHER)
 		r.lock.RUnlock()
 		if r.internal != nil && r.internal.ParticipantEgress != nil {
 			go func() {
@@ -1601,7 +1604,7 @@ func (r *Room) changeUpdateWorker() {
 			r.batchedUpdates = make(map[livekit.ParticipantIdentity]*ParticipantUpdate)
 			r.batchedUpdatesMu.Unlock()
 
-			SendParticipantUpdates(maps.Values(updatesMap), r.GetParticipants(), r.roomConfig.UpdateBatchTargetSize)
+			SendParticipantUpdates(slices.Collect(maps.Values(updatesMap)), r.GetParticipants(), r.roomConfig.UpdateBatchTargetSize)
 
 		case <-cleanDataMessageTicker.C:
 			r.dataMessageCache.Prune()
@@ -1846,12 +1849,13 @@ func (r *Room) createAgentDispatch(dispatch *livekit.AgentDispatch) (*agentDispa
 	return ad, nil
 }
 
-func (r *Room) createAgentDispatchFromParams(agentName string, metadata string) (*agentDispatch, error) {
+func (r *Room) createAgentDispatchFromRoomDispatch(rad *livekit.RoomAgentDispatch) (*agentDispatch, error) {
 	return r.createAgentDispatch(&livekit.AgentDispatch{
-		Id:        guid.New(guid.AgentDispatchPrefix),
-		AgentName: agentName,
-		Metadata:  metadata,
-		Room:      r.protoRoom.Name,
+		Id:            guid.New(guid.AgentDispatchPrefix),
+		AgentName:     rad.GetAgentName(),
+		Metadata:      rad.GetMetadata(),
+		Room:          r.protoRoom.Name,
+		RestartPolicy: rad.GetRestartPolicy(),
 	})
 }
 
@@ -1867,7 +1871,7 @@ func (r *Room) createAgentDispatchesFromRoomAgent() {
 	}
 
 	for _, ag := range roomDisp {
-		_, err := r.createAgentDispatchFromParams(ag.AgentName, ag.Metadata)
+		_, err := r.createAgentDispatchFromRoomDispatch(ag)
 		if err != nil {
 			r.logger.Warnw("failed storing room dispatch", err)
 		}
@@ -1891,6 +1895,10 @@ func (r *Room) GetCachedReliableDataMessage(seqs map[livekit.ParticipantID]uint3
 
 func (r *Room) LocalParticipantListener() types.LocalParticipantListener {
 	return r.localParticipantListener
+}
+
+func (r *Room) ParticipantTelemetryListener() types.ParticipantTelemetryListener {
+	return r.participantTelemetryListener
 }
 
 // ------------------------------------------------------------
@@ -1982,6 +1990,75 @@ func (l *localParticipantListener) OnSimulateScenario(p types.LocalParticipant, 
 
 func (l *localParticipantListener) OnLeave(p types.LocalParticipant, closeReason types.ParticipantCloseReason) {
 	l.room.onLeave(p, closeReason)
+}
+
+// ------------------------------------------------------------
+
+var _ types.ParticipantTelemetryListener = (*participantTelemetryListener)(nil)
+
+type participantTelemetryListener struct {
+	room *Room
+}
+
+func (l participantTelemetryListener) OnTrackPublishRequested(pID livekit.ParticipantID, identity livekit.ParticipantIdentity, ti *livekit.TrackInfo) {
+	l.room.telemetry.TrackPublishRequested(context.Background(), l.room.ID(), l.room.Name(), pID, identity, ti)
+}
+
+func (l participantTelemetryListener) OnTrackPublished(pID livekit.ParticipantID, identity livekit.ParticipantIdentity, ti *livekit.TrackInfo, shouldSendEvent bool) {
+	l.room.telemetry.TrackPublished(context.Background(), l.room.ID(), l.room.Name(), pID, identity, ti, shouldSendEvent)
+}
+
+func (l participantTelemetryListener) OnTrackUnpublished(pID livekit.ParticipantID, identity livekit.ParticipantIdentity, ti *livekit.TrackInfo, shouldSendEvent bool) {
+	l.room.telemetry.TrackUnpublished(context.Background(), l.room.ID(), l.room.Name(), pID, identity, ti, shouldSendEvent)
+}
+
+func (l participantTelemetryListener) OnTrackSubscribeRequested(pID livekit.ParticipantID, ti *livekit.TrackInfo) {
+	l.room.telemetry.TrackSubscribeRequested(context.Background(), l.room.ID(), l.room.Name(), pID, ti)
+}
+
+func (l participantTelemetryListener) OnTrackSubscribed(pID livekit.ParticipantID, ti *livekit.TrackInfo, publisherInfo *livekit.ParticipantInfo, shouldSendEvent bool) {
+	l.room.telemetry.TrackSubscribed(context.Background(), l.room.ID(), l.room.Name(), pID, ti, publisherInfo, shouldSendEvent)
+}
+
+func (l participantTelemetryListener) OnTrackUnsubscribed(pID livekit.ParticipantID, ti *livekit.TrackInfo, shouldSendEvent bool) {
+	l.room.telemetry.TrackUnsubscribed(context.Background(), l.room.ID(), l.room.Name(), pID, ti, shouldSendEvent)
+}
+
+func (l participantTelemetryListener) OnTrackSubscribeFailed(pID livekit.ParticipantID, trackID livekit.TrackID, err error, isUserError bool) {
+	l.room.telemetry.TrackSubscribeFailed(context.Background(), l.room.ID(), l.room.Name(), pID, trackID, err, isUserError)
+}
+
+func (l participantTelemetryListener) OnTrackSubscribeStreamStarted(pID livekit.ParticipantID, ti *livekit.TrackInfo) {
+}
+
+func (l participantTelemetryListener) OnTrackMuted(pID livekit.ParticipantID, ti *livekit.TrackInfo) {
+	l.room.telemetry.TrackMuted(context.Background(), l.room.ID(), l.room.Name(), pID, ti)
+}
+
+func (l participantTelemetryListener) OnTrackUnmuted(pID livekit.ParticipantID, ti *livekit.TrackInfo) {
+	l.room.telemetry.TrackUnmuted(context.Background(), l.room.ID(), l.room.Name(), pID, ti)
+}
+
+func (l participantTelemetryListener) OnTrackPublishedUpdate(pID livekit.ParticipantID, ti *livekit.TrackInfo) {
+	l.room.telemetry.TrackPublishedUpdate(context.Background(), l.room.ID(), l.room.Name(), pID, ti)
+}
+
+func (l participantTelemetryListener) OnTrackMaxSubscribedVideoQuality(pID livekit.ParticipantID, ti *livekit.TrackInfo, mime mime.MimeType, maxQuality livekit.VideoQuality) {
+	l.room.telemetry.TrackMaxSubscribedVideoQuality(context.Background(), l.room.ID(), l.room.Name(), pID, ti, mime, maxQuality)
+}
+
+func (l participantTelemetryListener) OnTrackPublishRTPStats(pID livekit.ParticipantID, trackID livekit.TrackID, mimeType mime.MimeType, layer int, stats *livekit.RTPStats) {
+	l.room.telemetry.TrackPublishRTPStats(context.Background(), l.room.ID(), l.room.Name(), pID, trackID, mimeType, layer, stats)
+}
+
+func (l participantTelemetryListener) OnTrackSubscribeRTPStats(pID livekit.ParticipantID, trackID livekit.TrackID, mimeType mime.MimeType, stats *livekit.RTPStats) {
+	l.room.telemetry.TrackSubscribeRTPStats(context.Background(), l.room.ID(), l.room.Name(), pID, trackID, mimeType, stats)
+}
+
+func (l participantTelemetryListener) OnTrackStats(key telemetry.StatsKey, stat *livekit.AnalyticsStat) {
+	roomID, roomName := l.room.ID(), l.room.Name()
+	stat.RoomId, stat.RoomName = string(roomID), string(roomName)
+	l.room.telemetry.TrackStats(roomID, roomName, key, stat)
 }
 
 // ------------------------------------------------------------
@@ -2231,7 +2308,7 @@ func GetOtherParticipantInfo(
 
 	pInfos := make([]*livekit.ParticipantInfo, 0, len(allParticipants))
 	for _, op := range allParticipants {
-		if !(skipSubscriberBroadcast && op.CanSkipBroadcast()) &&
+		if (!skipSubscriberBroadcast || !op.CanSkipBroadcast()) &&
 			!op.Hidden() &&
 			op.Identity() != lpIdentity &&
 			!isMigratingIn {

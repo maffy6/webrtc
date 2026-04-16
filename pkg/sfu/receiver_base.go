@@ -116,7 +116,6 @@ type TrackReceiver interface {
 
 	SendPLI(layer int32, force bool)
 
-	SetUpTrackPaused(paused bool)
 	SetMaxExpectedSpatialLayer(layer int32)
 
 	AddDownTrack(track TrackSender) error
@@ -255,7 +254,7 @@ func NewReceiverBase(params ReceiverBaseParams, trackInfo *livekit.TrackInfo, co
 	)
 	r.streamTrackerManager.SetListener(r)
 
-	r.startForwarderGeneration()
+	r.startForwardersGeneration()
 
 	return r
 }
@@ -352,7 +351,15 @@ func (r *ReceiverBase) UpdateTrackInfo(ti *livekit.TrackInfo) {
 		)
 	}
 	r.trackInfo = utils.CloneProto(ti)
-	// MUTABLE-TRACKINFO-TODO: notify buffers, buffers may need to resize retransmission buffer if there is layer change
+
+	paused := r.trackInfo.GetMuted()
+	for _, buff := range r.buffers {
+		if buff == nil {
+			continue
+		}
+
+		buff.SetPaused(paused)
+	}
 	r.bufferMu.Unlock()
 
 	r.streamTrackerManager.UpdateTrackInfo(ti)
@@ -368,6 +375,13 @@ func (r *ReceiverBase) Restart(reason string) {
 }
 
 func (r *ReceiverBase) restartInternal(reason string, isDetected bool) {
+	r.params.Logger.Debugw(
+		"restart receiver",
+		"reason", reason,
+		"isDetected", isDetected,
+		"isClosed", r.IsClosed(),
+	)
+
 	if r.IsClosed() {
 		return
 	}
@@ -375,6 +389,7 @@ func (r *ReceiverBase) restartInternal(reason string, isDetected bool) {
 	// 1. guard against concurrent restarts
 	r.bufferMu.Lock()
 	if r.restartInProgress {
+		r.params.Logger.Debugw("restart receiver, skipping duplicate")
 		r.bufferMu.Unlock()
 		return
 	}
@@ -382,54 +397,84 @@ func (r *ReceiverBase) restartInternal(reason string, isDetected bool) {
 
 	// 2. advance forwarder generation
 	r.forwardersGeneration.Inc()
+	r.params.Logger.Debugw(
+		"restart receiver, advanced forwarder generation",
+		"forwardersGeneration", r.forwardersGeneration.Load(),
+	)
 	r.bufferMu.Unlock()
 
-	// 3. restart all the buffers
-	// if a stream was detected, skip external restart
+	// 3. mark for restart all the buffers
+	// if a stream restart was detected, skip external restart
 	//
 	// NOTE: The case of external restart and detected restart (which usually comes from one buffer)
 	//       racing will miss restart on all buffers if detected restart from one buffer adds the guard
 	//       against concurrent restart. But, that condition should be very rare if at all.
 	//       External restart happens when the underlying track changes or when seeking
 	if !isDetected {
-		for _, buff := range r.GetAllBuffers() {
+		for layer, buff := range r.GetAllBuffers() {
 			if buff == nil {
 				continue
 			}
 
-			buff.RestartStream(reason)
+			r.params.Logger.Debugw("restart receiver, marking buffer for restart", "layer", layer)
+			buff.MarkForRestartStream(reason)
 		}
+		r.params.Logger.Debugw("restart receiver, marked buffers for restart")
 	}
 
 	// 4. wait for the forwarders to finish
 	r.waitForForwardersStop()
+	r.params.Logger.Debugw("restart receiver, forwarders stopped")
 
-	// 5. reset stream tracker
+	// 5. restart all the buffers
+	// Two phase restart - mark, followed by restart to ensure
+	// a fresh start after existing forwarder is stopped
+	if !isDetected {
+		for layer, buff := range r.GetAllBuffers() {
+			if buff == nil {
+				continue
+			}
+
+			r.params.Logger.Debugw("restart receiver, restarting buffer", "layer", layer)
+			buff.RestartStream(reason)
+		}
+		r.params.Logger.Debugw("restart receiver, restarted buffers")
+	}
+
+	// 6. reset stream tracker
 	r.streamTrackerManager.RemoveAllTrackers()
+	r.params.Logger.Debugw("restart receiver, stream trackers removed")
 
-	// 6. signal attached downtracks to resync so that they can have proper sequencing on a receiver restart
+	// 7. signal attached downtracks to resync so that they can have proper sequencing on a receiver restart
 	r.downTrackSpreader.Broadcast(func(dt TrackSender) {
 		dt.ReceiverRestart(r)
 	})
 	if rt := r.loadREDTransformer(); rt != nil {
 		rt.OnStreamRestart()
 	}
+	r.params.Logger.Debugw("restart receiver, down tracks signalled")
 
-	// 7. move forwarder generation ahead
-	r.startForwarderGeneration()
+	// 8. move forwarder generation ahead
+	r.startForwardersGeneration()
+	r.params.Logger.Debugw(
+		"restart receiver, restarted forwarder generation",
+		"forwardersGeneration", r.forwardersGeneration.Load(),
+	)
 
 	r.bufferMu.Lock()
-	// 8. release restart hold
+	// 9. release restart hold
 	r.restartInProgress = false
 
-	// 9. restart forwarders
+	// 10. restart forwarders
 	for layer, buff := range r.buffers {
 		if buff == nil {
 			continue
 		}
 
+		r.params.Logger.Debugw("restart receiver, restarting forwarder", "layer", layer)
 		r.startForwarderForBufferLocked(int32(layer), buff)
 	}
+	r.params.Logger.Debugw("restart receiver, restarted forwarders")
 	r.bufferMu.Unlock()
 }
 
@@ -500,23 +545,6 @@ func (r *ReceiverBase) Kind() webrtc.RTPCodecType {
 
 func (r *ReceiverBase) StreamTrackerManager() *StreamTrackerManager {
 	return r.streamTrackerManager
-}
-
-// SetUpTrackPaused indicates upstream will not be sending any data.
-// this will reflect the "muted" status and will pause streamtracker to ensure we don't turn off
-// the layer
-func (r *ReceiverBase) SetUpTrackPaused(paused bool) {
-	r.streamTrackerManager.SetPaused(paused)
-
-	r.bufferMu.RLock()
-	for _, buff := range r.buffers {
-		if buff == nil {
-			continue
-		}
-
-		buff.SetPaused(paused)
-	}
-	r.bufferMu.RUnlock()
 }
 
 func (r *ReceiverBase) AddDownTrack(track TrackSender) error {
@@ -722,13 +750,14 @@ func (r *ReceiverBase) GetOrCreateBuffer(layer int32) buffer.BufferProvider {
 	r.bufferMu.Lock()
 	r.buffers[layer] = buff
 	rtt := r.rtt
+	paused := r.trackInfo.GetMuted()
 	r.bufferMu.Unlock()
 
-	r.setupBuffer(buff, layer, rtt)
+	r.setupBuffer(buff, layer, rtt, paused)
 	return buff
 }
 
-func (r *ReceiverBase) setupBuffer(buff buffer.BufferProvider, layer int32, rtt uint32) {
+func (r *ReceiverBase) setupBuffer(buff buffer.BufferProvider, layer int32, rtt uint32, paused bool) {
 	buff.SetLogger(r.params.Logger.WithValues("layer", layer))
 	buff.SetAudioLevelConfig(r.audioConfig.AudioLevelConfig)
 	buff.SetStreamRestartDetection(r.enableRTPStreamRestartDetection)
@@ -780,16 +809,17 @@ func (r *ReceiverBase) setupBuffer(buff buffer.BufferProvider, layer int32, rtt 
 	}
 
 	buff.SetRTT(rtt)
-	buff.SetPaused(r.streamTrackerManager.IsPaused())
+	buff.SetPaused(paused)
 }
 
 func (r *ReceiverBase) AddBuffer(buff buffer.BufferProvider, layer int32) {
 	r.bufferMu.Lock()
 	r.buffers[layer] = buff
 	rtt := r.rtt
+	paused := r.trackInfo.GetMuted()
 	r.bufferMu.Unlock()
 
-	r.setupBuffer(buff, layer, rtt)
+	r.setupBuffer(buff, layer, rtt, paused)
 }
 
 func (r *ReceiverBase) StartBuffer(buff buffer.BufferProvider, layer int32) {
@@ -878,7 +908,7 @@ func (r *ReceiverBase) GetAudioLevel() (float64, bool) {
 	return 0, false
 }
 
-func (r *ReceiverBase) startForwarderGeneration() {
+func (r *ReceiverBase) startForwardersGeneration() {
 	r.bufferMu.Lock()
 	defer r.bufferMu.Unlock()
 
@@ -888,16 +918,17 @@ func (r *ReceiverBase) startForwarderGeneration() {
 
 func (r *ReceiverBase) waitForForwardersStop() {
 	r.bufferMu.Lock()
-	forwarderWaitGroup := r.forwardersWaitGroup
+	forwardersWaitGroup := r.forwardersWaitGroup
 	r.bufferMu.Unlock()
 
-	if forwarderWaitGroup != nil {
-		forwarderWaitGroup.Wait()
+	if forwardersWaitGroup != nil {
+		forwardersWaitGroup.Wait()
 	}
 }
 
 func (r *ReceiverBase) startForwarderForBufferLocked(layer int32, buff buffer.BufferProvider) {
 	if r.restartInProgress {
+		r.params.Logger.Debugw("restart in progress, deferring starting forwarder", "layer", layer)
 		return
 	}
 
@@ -1122,10 +1153,10 @@ func (r *ReceiverBase) AddOnReady(fn func()) {
 	fn()
 }
 
-func (w *ReceiverBase) handleCodecChange(newCodec webrtc.RTPCodecParameters) {
+func (r *ReceiverBase) handleCodecChange(newCodec webrtc.RTPCodecParameters) {
 	// codec fallback is not supported mid-session, i.e. change of codec via payload type change,
 	// set the codec state to invalid once it happens
-	w.SetCodecState(ReceiverCodecStateInvalid)
+	r.SetCodecState(ReceiverCodecStateInvalid)
 }
 
 func (r *ReceiverBase) AddOnCodecStateChange(f func(webrtc.RTPCodecParameters, ReceiverCodecState)) {

@@ -19,16 +19,16 @@ package rtc
 import (
 	"context"
 	"errors"
+	"maps"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/pion/webrtc/v4/pkg/rtcerr"
 	"go.uber.org/atomic"
-	"golang.org/x/exp/maps"
 
 	"github.com/livekit/livekit-server/pkg/rtc/types"
 	"github.com/livekit/livekit-server/pkg/sfu"
-	"github.com/livekit/livekit-server/pkg/telemetry"
 	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
@@ -57,7 +57,7 @@ type SubscriptionManagerParams struct {
 	OnTrackSubscribed   func(subTrack types.SubscribedTrack)
 	OnTrackUnsubscribed func(subTrack types.SubscribedTrack)
 	OnSubscriptionError func(trackID livekit.TrackID, fatal bool, err error)
-	Telemetry           telemetry.TelemetryService
+	TelemetryListener   types.ParticipantTelemetryListener
 
 	SubscriptionLimitVideo, SubscriptionLimitAudio int32
 
@@ -115,6 +115,21 @@ func (m *SubscriptionManager) Close(isExpectedToResume bool) {
 
 	prometheus.RecordTrackSubscribeCancels(int32(m.getNumCancellations()))
 
+	// Remove observer closures from track change/remove notifiers to allow
+	// this participant and its transports to be garbage collected.
+	m.lock.Lock()
+	subs := maps.Clone(m.subscriptions)
+	dataTrackSubs := maps.Clone(m.dataTrackSubscriptions)
+	m.lock.Unlock()
+	for _, sub := range subs {
+		sub.setChangedNotifier(nil)
+		sub.setRemovedNotifier(nil)
+	}
+	for _, dataTrackSub := range dataTrackSubs {
+		dataTrackSub.setChangedNotifier(nil)
+		dataTrackSub.setRemovedNotifier(nil)
+	}
+
 	subTracks := m.GetSubscribedTracks()
 	downTracksToClose := make([]*sfu.DownTrack, 0, len(subTracks))
 	for _, st := range subTracks {
@@ -137,8 +152,9 @@ func (m *SubscriptionManager) Close(isExpectedToResume bool) {
 		}
 	}
 
-	m.lock.Lock()
-	for _, sub := range m.dataTrackSubscriptions {
+	for trackID, sub := range dataTrackSubs {
+		m.setDataTrackDesired(trackID, false)
+
 		dataDownTrack := sub.getDataDownTrack()
 		if dataDownTrack == nil {
 			// already unsubscribed
@@ -152,7 +168,6 @@ func (m *SubscriptionManager) Close(isExpectedToResume bool) {
 
 		dataTrack.RemoveSubscriber(sub.subscriberID)
 	}
-	m.lock.Unlock()
 	m.notifyDataTrackSubscriberHandles()
 }
 
@@ -166,6 +181,10 @@ func (m *SubscriptionManager) isClosed() bool {
 }
 
 func (m *SubscriptionManager) SubscribeToTrack(trackID livekit.TrackID, isSync bool) {
+	if m.isClosed() {
+		return
+	}
+
 	if m.params.UseOneShotSignallingMode || isSync {
 		m.subscribeSynchronous(trackID)
 		return
@@ -212,6 +231,10 @@ func (m *SubscriptionManager) UnsubscribeFromTrack(trackID livekit.TrackID) {
 }
 
 func (m *SubscriptionManager) SubscribeToDataTrack(trackID livekit.TrackID) {
+	if m.isClosed() {
+		return
+	}
+
 	sub, desireChanged := m.setDataTrackDesired(trackID, true)
 	if sub == nil {
 		sLogger := m.params.Logger.WithValues(
@@ -333,7 +356,7 @@ func (m *SubscriptionManager) GetSubscribedParticipants() []livekit.ParticipantI
 	m.lock.RLock()
 	defer m.lock.RUnlock()
 
-	return maps.Keys(m.subscribedTo)
+	return slices.Collect(maps.Keys(m.subscribedTo))
 }
 
 func (m *SubscriptionManager) IsSubscribedTo(participantID livekit.ParticipantID) bool {
@@ -472,8 +495,7 @@ func (m *SubscriptionManager) reconcileSubscription(s *mediaTrackSubscription) {
 
 		numAttempts := s.getNumAttempts()
 		if numAttempts == 0 {
-			m.params.Telemetry.TrackSubscribeRequested(
-				context.Background(),
+			m.params.TelemetryListener.OnTrackSubscribeRequested(
 				s.subscriberID,
 				&livekit.TrackInfo{
 					Sid: string(s.trackID),
@@ -493,14 +515,14 @@ func (m *SubscriptionManager) reconcileSubscription(s *mediaTrackSubscription) {
 				// - ErrSubscriptionLimitExceeded: the participant have reached the limit of subscriptions, wait for the other subscription to be unsubscribed
 				// We'll still log an event to reflect this in telemetry since it's been too long
 				if s.durationSinceStart() > subscriptionTimeout {
-					s.maybeRecordError(m.params.Telemetry, s.subscriberID, err, true)
+					s.maybeRecordError(m.params.TelemetryListener, err, true)
 				}
 			case ErrTrackNotFound:
 				// source track was never published or closed
 				// if after timeout we'd unsubscribe from it.
 				// this is the *only* case we'd change desired state
 				if s.durationSinceStart() > notFoundTimeout {
-					s.maybeRecordError(m.params.Telemetry, s.subscriberID, err, true)
+					s.maybeRecordError(m.params.TelemetryListener, err, true)
 					s.logger.Infow("unsubscribing from track after notFoundTimeout", "error", err)
 					s.setDesired(false)
 					m.queueReconcile(s.trackID)
@@ -513,7 +535,7 @@ func (m *SubscriptionManager) reconcileSubscription(s *mediaTrackSubscription) {
 						"failed to subscribe, triggering error handler", err,
 						"attempt", s.getNumAttempts(),
 					)
-					s.maybeRecordError(m.params.Telemetry, s.subscriberID, err, false)
+					s.maybeRecordError(m.params.TelemetryListener, err, false)
 					m.params.OnSubscriptionError(s.trackID, true, err)
 				} else {
 					s.logger.Debugw(
@@ -552,7 +574,7 @@ func (m *SubscriptionManager) reconcileSubscription(s *mediaTrackSubscription) {
 			wait := min(time.Since(activeAt), s.durationSinceStart())
 			if wait > subscriptionTimeout {
 				s.logger.Warnw("track not bound after timeout", nil)
-				s.maybeRecordError(m.params.Telemetry, s.subscriberID, ErrTrackNotBound, false)
+				s.maybeRecordError(m.params.TelemetryListener, ErrTrackNotBound, false)
 				m.params.OnSubscriptionError(s.trackID, true, ErrTrackNotBound)
 			}
 		}
@@ -839,13 +861,13 @@ func (m *SubscriptionManager) addSubscriber(sub *mediaTrackSubscription, track t
 		subTrack.AddOnBind(func(err error) {
 			if err != nil {
 				sub.logger.Infow("failed to bind track", "err", err)
-				sub.maybeRecordError(m.params.Telemetry, sub.subscriberID, err, true)
+				sub.maybeRecordError(m.params.TelemetryListener, err, true)
 				m.UnsubscribeFromTrack(trackID)
 				m.params.OnSubscriptionError(trackID, false, err)
 				return
 			}
 			sub.setBound()
-			sub.maybeRecordSuccess(m.params.Telemetry, sub.subscriberID)
+			sub.maybeRecordSuccess(m.params.TelemetryListener)
 		})
 		sub.setSubscribedTrack(subTrack)
 
@@ -947,6 +969,8 @@ func (m *SubscriptionManager) handleSubscribedTrackClose(s *mediaTrackSubscripti
 		return
 	}
 	s.setSubscribedTrack(nil)
+	s.setChangedNotifier(nil)
+	s.setRemovedNotifier(nil)
 
 	var relieveFromLimits bool
 	switch subTrack.MediaTrack().Kind() {
@@ -967,8 +991,7 @@ func (m *SubscriptionManager) handleSubscribedTrackClose(s *mediaTrackSubscripti
 	// * the participant isn't closing
 	// * it's not a migration
 	if wasBound {
-		m.params.Telemetry.TrackUnsubscribed(
-			context.Background(),
+		m.params.TelemetryListener.OnTrackUnsubscribed(
 			s.subscriberID,
 			&livekit.TrackInfo{Sid: string(s.trackID), Type: subTrack.MediaTrack().Kind()},
 			!isExpectedToResume,
@@ -978,8 +1001,7 @@ func (m *SubscriptionManager) handleSubscribedTrackClose(s *mediaTrackSubscripti
 		if dt != nil {
 			stats := dt.GetTrackStats()
 			if stats != nil {
-				m.params.Telemetry.TrackSubscribeRTPStats(
-					context.Background(),
+				m.params.TelemetryListener.OnTrackSubscribeRTPStats(
 					s.subscriberID,
 					s.trackID,
 					dt.Mime(),
@@ -1088,6 +1110,9 @@ func (m *SubscriptionManager) unsubscribeDataTrack(s *dataTrackSubscription) err
 
 	dataTrack := dataDownTrack.PublishDataTrack()
 	dataTrack.RemoveSubscriber(s.subscriberID)
+
+	s.setChangedNotifier(nil)
+	s.setRemovedNotifier(nil)
 
 	m.unmarkSubscribedTo(s.getPublisherID(), s.trackID)
 	return nil
@@ -1437,15 +1462,15 @@ func (s *mediaTrackSubscription) isBound() bool {
 	return s.bound
 }
 
-func (s *mediaTrackSubscription) maybeRecordError(ts telemetry.TelemetryService, pID livekit.ParticipantID, err error, isUserError bool) {
+func (s *mediaTrackSubscription) maybeRecordError(tl types.ParticipantTelemetryListener, err error, isUserError bool) {
 	if s.eventSent.Swap(true) {
 		return
 	}
 
-	ts.TrackSubscribeFailed(context.Background(), pID, s.trackID, err, isUserError)
+	tl.OnTrackSubscribeFailed(s.subscriberID, s.trackID, err, isUserError)
 }
 
-func (s *mediaTrackSubscription) maybeRecordSuccess(ts telemetry.TelemetryService, pID livekit.ParticipantID) {
+func (s *mediaTrackSubscription) maybeRecordSuccess(tl types.ParticipantTelemetryListener) {
 	subTrack := s.getSubscribedTrack()
 	if subTrack == nil {
 		return
@@ -1474,7 +1499,7 @@ func (s *mediaTrackSubscription) maybeRecordSuccess(ts telemetry.TelemetryServic
 		Identity: string(subTrack.PublisherIdentity()),
 		Sid:      string(subTrack.PublisherID()),
 	}
-	ts.TrackSubscribed(context.Background(), pID, mediaTrack.ToProto(), pi, !eventSent)
+	tl.OnTrackSubscribed(s.subscriberID, mediaTrack.ToProto(), pi, !eventSent)
 }
 
 func (s *mediaTrackSubscription) isCanceled() bool {
