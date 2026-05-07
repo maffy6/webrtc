@@ -20,7 +20,6 @@ import (
 	"maps"
 	"math"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +27,7 @@ import (
 	"go.uber.org/atomic"
 	"google.golang.org/protobuf/proto"
 
+	protoagent "github.com/livekit/protocol/agent"
 	"github.com/livekit/protocol/codecs/mime"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
@@ -393,8 +393,8 @@ func (r *Room) GetActiveSpeakers() []*livekit.SpeakerInfo {
 		})
 	}
 
-	sort.Slice(speakers, func(i, j int) bool {
-		return speakers[i].Level > speakers[j].Level
+	slices.SortFunc(speakers, func(a, b *livekit.SpeakerInfo) int {
+		return sutils.Signum(b.Level - a.Level)
 	})
 
 	// quantize to smooth out small changes
@@ -1771,6 +1771,7 @@ func (r *Room) launchRoomAgents(ads []*agentDispatch) {
 				Metadata:   ad.Metadata,
 				AgentName:  ad.AgentName,
 				DispatchId: ad.Id,
+				Deployment: ad.Deployment,
 			})
 			r.handleNewJobs(ad.AgentDispatch, inc)
 			done()
@@ -1794,6 +1795,7 @@ func (r *Room) launchTargetAgents(ads []*agentDispatch, p types.Participant, job
 				Metadata:    ad.Metadata,
 				AgentName:   ad.AgentName,
 				DispatchId:  ad.Id,
+				Deployment:  ad.Deployment,
 			})
 			r.handleNewJobs(ad.AgentDispatch, inc)
 			done()
@@ -1850,12 +1852,16 @@ func (r *Room) createAgentDispatch(dispatch *livekit.AgentDispatch) (*agentDispa
 }
 
 func (r *Room) createAgentDispatchFromRoomDispatch(rad *livekit.RoomAgentDispatch) (*agentDispatch, error) {
+	if err := protoagent.ValidateDeployment(rad.GetDeployment()); err != nil {
+		return nil, err
+	}
 	return r.createAgentDispatch(&livekit.AgentDispatch{
 		Id:            guid.New(guid.AgentDispatchPrefix),
 		AgentName:     rad.GetAgentName(),
 		Metadata:      rad.GetMetadata(),
 		Room:          r.protoRoom.Name,
 		RestartPolicy: rad.GetRestartPolicy(),
+		Deployment:    rad.GetDeployment(),
 	})
 }
 
@@ -2334,7 +2340,7 @@ func connectionDetailsFields(infos []*types.ICEConnectionInfo) []any {
 			if c.Trickle {
 				cStr += "[trickle]"
 			}
-			cStr += " " + c.Local.String()
+			cStr += " " + c.Candidate.String()
 			candidates = append(candidates, cStr)
 		}
 		for _, c := range info.Remote {
@@ -2347,11 +2353,11 @@ func connectionDetailsFields(infos []*types.ICEConnectionInfo) []any {
 			if c.Trickle {
 				cStr += "[trickle]"
 			}
-			cStr += " " + fmt.Sprintf("%s %s %s:%d", c.Remote.NetworkType(), c.Remote.Type(), MaybeTruncateIP(c.Remote.Address()), c.Remote.Port())
-			if relatedAddress := c.Remote.RelatedAddress(); relatedAddress != nil {
-				relatedAddr := MaybeTruncateIP(relatedAddress.Address)
+			cStr += " " + fmt.Sprintf("%s %s %s:%d", c.Candidate.Protocol.String(), c.Candidate.Typ.String(), MaybeTruncateIP(c.Candidate.Address), c.Candidate.Port)
+			if relatedAddress := c.Candidate.RelatedAddress; relatedAddress != "" {
+				relatedAddr := MaybeTruncateIP(relatedAddress)
 				if relatedAddr != "" {
-					cStr += " " + fmt.Sprintf(" related %s:%d", relatedAddr, relatedAddress.Port)
+					cStr += " " + fmt.Sprintf(" related %s:%d", relatedAddr, c.Candidate.RelatedPort)
 				}
 			}
 			candidates = append(candidates, cStr)

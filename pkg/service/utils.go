@@ -187,6 +187,18 @@ func ParseClientInfo(r *http.Request) *livekit.ClientInfo {
 	ci.DeviceModel = values.Get("device_model")
 	ci.Network = values.Get("network")
 
+	if capStr := values.Get("capabilities"); capStr != "" {
+		for _, name := range strings.Split(capStr, ",") {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			if v, ok := livekit.ClientInfo_Capability_value[name]; ok {
+				ci.Capabilities = append(ci.Capabilities, livekit.ClientInfo_Capability(v))
+			}
+		}
+	}
+
 	AugmentClientInfo(ci, r)
 
 	return ci
@@ -394,6 +406,10 @@ func IsRTCPath(path string) bool {
 
 func IsRTCValidatePath(path string) bool {
 	return path == "/rtc/validate" || path == "/rtc/v1/validate"
+}
+
+func IsAgentWorkerPath(path string) bool {
+	return path == "/agent"
 }
 
 func IsAgentPath(path string) bool {
