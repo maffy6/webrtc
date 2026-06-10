@@ -154,7 +154,7 @@ type BufferBase struct {
 	bucket               *bucket.Bucket[uint64, uint16]
 	lastBucketCapCheckAt int64
 
-	nacker              *nack.NackQueue
+	nacker              nack.NackQueueInterface
 	rtpStatsLite        *rtpstats.RTPStatsReceiverLite
 	liteStatsSnapshotId uint32
 
@@ -387,7 +387,9 @@ func (b *BufferBase) BindLocked(rtpParameters webrtc.RTPParameters, codec webrtc
 			}
 
 			b.logger.Debugw("Setting feedback", "type", webrtc.TypeRTCPFBNACK)
-			b.nacker = nack.NewNACKQueue(nack.NackQueueParamsDefault)
+			if b.nacker == nil {
+				b.nacker = nack.NewNACKQueue(nack.NackQueueParamsDefault)
+			}
 		}
 	}
 

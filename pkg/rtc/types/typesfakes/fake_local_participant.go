@@ -913,6 +913,16 @@ type FakeLocalParticipant struct {
 	kindReturnsOnCall map[int]struct {
 		result1 livekit.ParticipantInfo_Kind
 	}
+	KindDetailsStub        func() []livekit.ParticipantInfo_KindDetail
+	kindDetailsMutex       sync.RWMutex
+	kindDetailsArgsForCall []struct {
+	}
+	kindDetailsReturns struct {
+		result1 []livekit.ParticipantInfo_KindDetail
+	}
+	kindDetailsReturnsOnCall map[int]struct {
+		result1 []livekit.ParticipantInfo_KindDetail
+	}
 	MaybeStartMigrationStub        func(bool, func()) bool
 	maybeStartMigrationMutex       sync.RWMutex
 	maybeStartMigrationArgsForCall []struct {
@@ -1331,6 +1341,16 @@ type FakeLocalParticipant struct {
 	toProtoWithVersionReturnsOnCall map[int]struct {
 		result1 *livekit.ParticipantInfo
 		result2 utils.TimedVersion
+	}
+	TokenExpiresAtStub        func() time.Time
+	tokenExpiresAtMutex       sync.RWMutex
+	tokenExpiresAtArgsForCall []struct {
+	}
+	tokenExpiresAtReturns struct {
+		result1 time.Time
+	}
+	tokenExpiresAtReturnsOnCall map[int]struct {
+		result1 time.Time
 	}
 	UncacheDownTrackStub        func(*webrtc.RTPTransceiver)
 	uncacheDownTrackMutex       sync.RWMutex
@@ -6243,6 +6263,59 @@ func (fake *FakeLocalParticipant) KindReturnsOnCall(i int, result1 livekit.Parti
 	}{result1}
 }
 
+func (fake *FakeLocalParticipant) KindDetails() []livekit.ParticipantInfo_KindDetail {
+	fake.kindDetailsMutex.Lock()
+	ret, specificReturn := fake.kindDetailsReturnsOnCall[len(fake.kindDetailsArgsForCall)]
+	fake.kindDetailsArgsForCall = append(fake.kindDetailsArgsForCall, struct {
+	}{})
+	stub := fake.KindDetailsStub
+	fakeReturns := fake.kindDetailsReturns
+	fake.recordInvocation("KindDetails", []interface{}{})
+	fake.kindDetailsMutex.Unlock()
+	if stub != nil {
+		return stub()
+	}
+	if specificReturn {
+		return ret.result1
+	}
+	return fakeReturns.result1
+}
+
+func (fake *FakeLocalParticipant) KindDetailsCallCount() int {
+	fake.kindDetailsMutex.RLock()
+	defer fake.kindDetailsMutex.RUnlock()
+	return len(fake.kindDetailsArgsForCall)
+}
+
+func (fake *FakeLocalParticipant) KindDetailsCalls(stub func() []livekit.ParticipantInfo_KindDetail) {
+	fake.kindDetailsMutex.Lock()
+	defer fake.kindDetailsMutex.Unlock()
+	fake.KindDetailsStub = stub
+}
+
+func (fake *FakeLocalParticipant) KindDetailsReturns(result1 []livekit.ParticipantInfo_KindDetail) {
+	fake.kindDetailsMutex.Lock()
+	defer fake.kindDetailsMutex.Unlock()
+	fake.KindDetailsStub = nil
+	fake.kindDetailsReturns = struct {
+		result1 []livekit.ParticipantInfo_KindDetail
+	}{result1}
+}
+
+func (fake *FakeLocalParticipant) KindDetailsReturnsOnCall(i int, result1 []livekit.ParticipantInfo_KindDetail) {
+	fake.kindDetailsMutex.Lock()
+	defer fake.kindDetailsMutex.Unlock()
+	fake.KindDetailsStub = nil
+	if fake.kindDetailsReturnsOnCall == nil {
+		fake.kindDetailsReturnsOnCall = make(map[int]struct {
+			result1 []livekit.ParticipantInfo_KindDetail
+		})
+	}
+	fake.kindDetailsReturnsOnCall[i] = struct {
+		result1 []livekit.ParticipantInfo_KindDetail
+	}{result1}
+}
+
 func (fake *FakeLocalParticipant) MaybeStartMigration(arg1 bool, arg2 func()) bool {
 	fake.maybeStartMigrationMutex.Lock()
 	ret, specificReturn := fake.maybeStartMigrationReturnsOnCall[len(fake.maybeStartMigrationArgsForCall)]
@@ -8551,6 +8624,59 @@ func (fake *FakeLocalParticipant) ToProtoWithVersionReturnsOnCall(i int, result1
 		result1 *livekit.ParticipantInfo
 		result2 utils.TimedVersion
 	}{result1, result2}
+}
+
+func (fake *FakeLocalParticipant) TokenExpiresAt() time.Time {
+	fake.tokenExpiresAtMutex.Lock()
+	ret, specificReturn := fake.tokenExpiresAtReturnsOnCall[len(fake.tokenExpiresAtArgsForCall)]
+	fake.tokenExpiresAtArgsForCall = append(fake.tokenExpiresAtArgsForCall, struct {
+	}{})
+	stub := fake.TokenExpiresAtStub
+	fakeReturns := fake.tokenExpiresAtReturns
+	fake.recordInvocation("TokenExpiresAt", []interface{}{})
+	fake.tokenExpiresAtMutex.Unlock()
+	if stub != nil {
+		return stub()
+	}
+	if specificReturn {
+		return ret.result1
+	}
+	return fakeReturns.result1
+}
+
+func (fake *FakeLocalParticipant) TokenExpiresAtCallCount() int {
+	fake.tokenExpiresAtMutex.RLock()
+	defer fake.tokenExpiresAtMutex.RUnlock()
+	return len(fake.tokenExpiresAtArgsForCall)
+}
+
+func (fake *FakeLocalParticipant) TokenExpiresAtCalls(stub func() time.Time) {
+	fake.tokenExpiresAtMutex.Lock()
+	defer fake.tokenExpiresAtMutex.Unlock()
+	fake.TokenExpiresAtStub = stub
+}
+
+func (fake *FakeLocalParticipant) TokenExpiresAtReturns(result1 time.Time) {
+	fake.tokenExpiresAtMutex.Lock()
+	defer fake.tokenExpiresAtMutex.Unlock()
+	fake.TokenExpiresAtStub = nil
+	fake.tokenExpiresAtReturns = struct {
+		result1 time.Time
+	}{result1}
+}
+
+func (fake *FakeLocalParticipant) TokenExpiresAtReturnsOnCall(i int, result1 time.Time) {
+	fake.tokenExpiresAtMutex.Lock()
+	defer fake.tokenExpiresAtMutex.Unlock()
+	fake.TokenExpiresAtStub = nil
+	if fake.tokenExpiresAtReturnsOnCall == nil {
+		fake.tokenExpiresAtReturnsOnCall = make(map[int]struct {
+			result1 time.Time
+		})
+	}
+	fake.tokenExpiresAtReturnsOnCall[i] = struct {
+		result1 time.Time
+	}{result1}
 }
 
 func (fake *FakeLocalParticipant) UncacheDownTrack(arg1 *webrtc.RTPTransceiver) {

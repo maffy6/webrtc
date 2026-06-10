@@ -49,8 +49,9 @@ const (
 )
 
 var (
-	ErrKeyFileIncorrectPermission = errors.New("key file others permissions must be set to 0")
-	ErrKeysNotSet                 = errors.New("one of key-file or keys must be provided")
+	ErrKeyFileIncorrectPermission        = errors.New("key file others permissions must be set to 0")
+	ErrTURNSecretFileIncorrectPermission = errors.New("turn secret file others permissions must be set to 0")
+	ErrKeysNotSet                        = errors.New("one of key-file or keys must be provided")
 )
 
 type Config struct {
@@ -115,6 +116,18 @@ type RTCConfig struct {
 	// allow TCP and TURN/TLS fallback
 	AllowTCPFallback *bool `yaml:"allow_tcp_fallback,omitempty"`
 
+	// Signaling RTT threshold (in milliseconds) governing ICE/TCP fallback. On a UDP
+	// failure, ICE/TCP is attempted only while the measured signaling RTT is below this
+	// value; at or above it, supporting clients fall back directly to TURN/TLS. When 0
+	// (the default), the RTT check is disabled and ICE/TCP is always attempted (for
+	// clients that support it). A positive value also gates allow_udp_unstable_fallback.
+	TCPFallbackRTTThreshold int `yaml:"tcp_fallback_rtt_threshold,omitempty"`
+
+	// When enabled, an established UDP connection reporting sustained high packet loss is
+	// migrated to ICE/TCP or TURN/TLS. Requires tcp_fallback_rtt_threshold to be set
+	// (> 0). Disabled by default.
+	AllowUDPUnstableFallback bool `yaml:"allow_udp_unstable_fallback,omitempty"`
+
 	// force a reconnect on a publication error
 	ReconnectOnPublicationError *bool `yaml:"reconnect_on_publication_error,omitempty"`
 
@@ -149,6 +162,8 @@ type TURNServer struct {
 	// Secret is used for TURN static auth secrets mechanism. When provided,
 	// dynamic credentials are generated using HMAC-SHA1 instead of static Username/Credential
 	Secret string `yaml:"secret,omitempty"`
+	// File containing the secret
+	SecretFile string `yaml:"secret_file,omitempty"`
 	// TTL is the time-to-live in seconds for generated credentials when using Secret.
 	// Defaults to 14400 seconds (4 hours) if not specified
 	TTL int `yaml:"ttl,omitempty"`
@@ -638,6 +653,33 @@ func (conf *Config) ValidateKeys() error {
 				logger.Errorw("secret is too short, should be at least 32 characters for security", nil, "apiKey", key)
 			}
 		}
+	}
+	return nil
+}
+
+func (conf *Config) LoadTURNSecrets() error {
+	var otherFilter os.FileMode = 0o007
+	for i, s := range conf.RTC.TURNServers {
+		if s.SecretFile == "" {
+			continue
+		}
+		if s.Secret != "" {
+			logger.Warnw("both secret and secret_file are set for TURN server, the hardcoded secret will be used", nil,
+				"host", s.Host, "port", s.Port)
+			continue
+		}
+		st, err := os.Stat(s.SecretFile)
+		if err != nil {
+			return err
+		}
+		if st.Mode().Perm()&otherFilter != 0o000 {
+			return ErrTURNSecretFileIncorrectPermission
+		}
+		data, err := os.ReadFile(s.SecretFile)
+		if err != nil {
+			return fmt.Errorf("reading turn secret file %q: %w", s.SecretFile, err)
+		}
+		conf.RTC.TURNServers[i].Secret = strings.TrimSpace(string(data))
 	}
 	return nil
 }
